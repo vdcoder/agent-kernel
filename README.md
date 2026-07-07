@@ -10,6 +10,12 @@ Everything in the framework is replaceable. There are no required implementation
 
 ---
 
+## Why this exists
+
+Agent Kernel is for teams that want agent orchestration without surrendering their application architecture. The kernel owns the conversation loop; the application owns domain state, tools, data, UI, and deployment.
+
+---
+
 ## Philosophy
 
 Most agent frameworks grow into platforms. This one grows in the opposite direction: the core is kept as small and replaceable as possible so that application code — the part that actually knows about your domain — is never constrained by framework opinions.
