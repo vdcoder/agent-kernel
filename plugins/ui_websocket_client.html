@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Modular Agent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.4/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <style>
+    /* Markdown inside assistant bubbles */
+    .md p          { margin-bottom: .45rem; }
+    .md p:last-child { margin-bottom: 0; }
+    .md code       { background:#1e293b; padding:.1rem .3rem; border-radius:3px; font-size:.82em; font-family:monospace; }
+    .md pre        { background:#0f172a; padding:.65rem .85rem; border-radius:6px; overflow-x:auto; margin:.45rem 0; }
+    .md pre code   { background:none; padding:0; }
+    .md ul,
+    .md ol         { padding-left:1.25rem; margin-bottom:.4rem; }
+    .md li         { margin-bottom:.1rem; }
+    .md strong     { font-weight:600; }
+    .md h1,.md h2,
+    .md h3         { font-weight:600; margin:.5rem 0 .25rem; }
+
+    /* Typing dots */
+    @keyframes dot-bounce {
+      0%,80%,100% { transform:scale(.65); opacity:.3; }
+      40%          { transform:scale(1);   opacity:1;  }
+    }
+    .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:#94a3b8;
+           animation:dot-bounce 1.2s infinite ease-in-out; }
+    .dot:nth-child(2) { animation-delay:.16s; }
+    .dot:nth-child(3) { animation-delay:.32s; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width:5px; }
+    ::-webkit-scrollbar-track { background:transparent; }
+    ::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 h-screen flex flex-col overflow-hidden">
+<div id="root" class="flex flex-col h-full"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function md(text) {
+  return { __html: marked.parse(text || "", { breaks: true }) };
+}
+
+function uid() { return Math.random().toString(36).slice(2); }
+
+// ── Small components ─────────────────────────────────────────────────────────
+
+function ConnectionDot({ connected }) {
+  return (
+    <span className={`inline-block w-2 h-2 rounded-full mr-2 ${connected ? "bg-emerald-400" : "bg-red-500"}`} />
+  );
+}
+
+function ThinkingDots({ label }) {
+  return (
+    <div className="flex items-center gap-2 px-4 py-2 text-slate-400 text-xs">
+      <span className="dot" /><span className="dot" /><span className="dot" />
+      <span className="ml-1 italic">{label || "thinking…"}</span>
+    </div>
+  );
+}
+
+// ── Message renderers ─────────────────────────────────────────────────────────
+
+function UserBubble({ text }) {
+  return (
+    <div className="flex justify-end mb-3">
+      <div className="max-w-[72%] bg-blue-600 text-white px-4 py-2.5 rounded-2xl rounded-br-sm text-sm shadow">
+        {text}
+      </div>
+    </div>
+  );
+}
+
+function AssistantBubble({ text }) {
+  return (
+    <div className="flex justify-start mb-3">
+      <div className="max-w-[78%] bg-slate-800 border border-slate-700 px-4 py-2.5 rounded-2xl rounded-bl-sm text-sm shadow">
+        <div className="md text-slate-100 leading-relaxed" dangerouslySetInnerHTML={md(text)} />
+      </div>
+    </div>
+  );
+}
+
+function ToolCallCard({ name, args }) {
+  const [open, setOpen] = useState(false);
+  let parsed;
+  try { parsed = JSON.stringify(JSON.parse(args), null, 2); } catch { parsed = args; }
+  return (
+    <div className="flex justify-start mb-1">
+      <div
+        className="max-w-[72%] bg-slate-800/60 border border-slate-600 rounded-xl px-3 py-1.5 text-xs text-slate-400 cursor-pointer hover:border-slate-500 transition-colors select-none"
+        onClick={() => setOpen(o => !o)}
+      >
+        <span className="mr-1.5">⚙</span>
+        <span className="font-mono text-cyan-400">{name}</span>
+        <span className="ml-1.5 text-slate-500">{open ? "▲" : "▼"}</span>
+        {open && (
+          <pre className="mt-1.5 text-slate-300 font-mono whitespace-pre-wrap break-all">{parsed}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ToolResultLine({ name, result }) {
+  return (
+    <div className="flex justify-start mb-2 pl-2">
+      <span className="text-xs text-slate-500">
+        🧠 <span className="font-mono text-slate-400">{name}</span>
+        <span className="ml-2 text-slate-600">{result.slice(0, 120)}{result.length > 120 ? "…" : ""}</span>
+      </span>
+    </div>
+  );
+}
+
+function MemoryCard({ memory }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="flex justify-start mb-2">
+      <div
+        className="max-w-[78%] border border-amber-700/50 bg-amber-900/10 rounded-xl px-3 py-1.5 text-xs text-amber-400 cursor-pointer hover:border-amber-600/60 transition-colors"
+        onClick={() => setOpen(o => !o)}
+      >
+        <span className="mr-1">🧠</span>
+        <span className="font-medium">memory updated</span>
+        <span className="ml-2 text-amber-600">{open ? "▲ hide" : "▼ show"}</span>
+        {open && (
+          <pre className="mt-2 text-amber-300/80 whitespace-pre-wrap font-mono leading-relaxed">{memory}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SystemLine({ text, color = "text-slate-500" }) {
+  return (
+    <div className={`text-center text-xs ${color} my-1 px-4`}>{text}</div>
+  );
+}
+
+function Message({ msg }) {
+  switch (msg.type) {
+    case "user":          return <UserBubble text={msg.text} />;
+    case "assistant":     return <AssistantBubble text={msg.text} />;
+    case "tool_call":     return <ToolCallCard name={msg.name} args={msg.arguments} />;
+    case "tool_result":   return <ToolResultLine name={msg.name} result={msg.result} />;
+    case "memory_update": return <MemoryCard memory={msg.memory} />;
+    case "info":          return <SystemLine text={msg.message} />;
+    case "warning":       return <SystemLine text={"⚠ " + msg.message} color="text-amber-500" />;
+    case "error":         return <SystemLine text={msg.message} color="text-red-400" />;
+    default:              return null;
+  }
+}
+
+// ── Confirm bar ───────────────────────────────────────────────────────────────
+
+function ConfirmBar({ confirm, onAnswer }) {
+  return (
+    <div className="border-t-2 border-amber-500 bg-amber-950 px-4 py-4 flex items-center gap-3"
+         style={{animation:"pulse 1.5s ease-in-out infinite",boxShadow:"0 -4px 20px rgba(251,191,36,0.25)"}}>
+      <div className="flex-1">
+        <div className="text-amber-300 font-bold text-sm mb-0.5">⚠ Action requires your approval</div>
+        <div className="text-white font-mono text-sm">{confirm.title}</div>
+        {confirm.detail && (
+          <div className="text-amber-400/70 text-xs mt-0.5 truncate">{confirm.detail.slice(0, 100)}</div>
+        )}
+      </div>
+      <button
+        onClick={() => onAnswer(true)}
+        className="bg-emerald-500 hover:bg-emerald-400 text-white font-bold px-6 py-2 rounded-lg transition-colors text-sm"
+      >
+        ✓ Yes
+      </button>
+      <button
+        onClick={() => onAnswer(false)}
+        className="bg-slate-600 hover:bg-slate-500 text-white font-bold px-6 py-2 rounded-lg transition-colors text-sm"
+      >
+        ✗ No
+      </button>
+    </div>
+  );
+}
+
+// ── Input bar ─────────────────────────────────────────────────────────────────
+
+function InputBar({ onSend, disabled }) {
+  const [text, setText] = useState("");
+  const inputRef = React.useRef(null);
+  const submit = (e) => {
+    e.preventDefault();
+    if (!text.trim() || disabled) return;
+    onSend(text.trim());
+    setText("");
+    // Re-focus so the user can keep typing immediately
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
+  return (
+    <form onSubmit={submit} className="border-t border-slate-700 bg-slate-900 px-4 py-3 flex gap-2">
+      <input
+        ref={inputRef}
+        value={text}
+        onChange={e => setText(e.target.value)}
+        disabled={disabled}
+        placeholder={disabled ? "Waiting for agent…" : "Type a message…"}
+        className="flex-1 bg-slate-800 border border-slate-600 rounded-xl px-4 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-blue-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+      />
+      <button
+        type="submit"
+        disabled={disabled || !text.trim()}
+        className="bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white px-5 py-2 rounded-xl text-sm font-medium transition-colors"
+      >
+        Send
+      </button>
+    </form>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
+function App() {
+  const [messages, setMessages]       = useState([]);
+  const [agentState, setAgentState]   = useState("idle");     // "idle" | "thinking" | "tool_running"
+  const [confirm, setConfirm]         = useState(null);       // {title, detail} | null
+  const [banner, setBanner]           = useState(null);
+  const [connected, setConnected]     = useState(false);
+  const wsRef      = useRef(null);
+  const bottomRef  = useRef(null);
+
+  const addMsg = useCallback((msg) => {
+    setMessages(prev => [...prev, { id: uid(), ...msg }]);
+  }, []);
+
+  // Auto-scroll
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, agentState]);
+
+  // WebSocket
+  useEffect(() => {
+    function connect() {
+      console.log(`[WS] connecting to ${WS_URL}`);
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log(`[WS] open — readyState=${ws.readyState}`);
+        setConnected(true);
+      };
+      ws.onclose = (e) => {
+        console.warn(`[WS] closed — code=${e.code} reason="${e.reason}" wasClean=${e.wasClean} readyState=${ws.readyState}`);
+        setConnected(false);
+        setAgentState("idle");
+        setTimeout(connect, 2000);
+      };
+      ws.onerror = (e) => {
+        console.error(`[WS] error — readyState=${ws.readyState}`, e);
+        ws.close();
+      };
+
+      ws.onmessage = (evt) => {
+        let data;
+        try { data = JSON.parse(evt.data); } catch { return; }
+
+        switch (data.type) {
+          case "state":
+            setAgentState(data.value);
+            break;
+          case "response":
+            addMsg({ type: "assistant", text: data.text });
+            break;
+          case "tool_call":
+            addMsg({ type: "tool_call", name: data.name, arguments: data.arguments });
+            break;
+          case "tool_result":
+            addMsg({ type: "tool_result", name: data.name, result: data.result });
+            break;
+          case "memory_update":
+            addMsg({ type: "memory_update", memory: data.memory });
+            break;
+          case "info":
+            addMsg({ type: "info", message: data.message });
+            break;
+          case "warning":
+            addMsg({ type: "warning", message: data.message });
+            break;
+          case "error":
+            addMsg({ type: "error", message: data.message });
+            break;
+          case "banner":
+            setBanner(data);
+            break;
+          case "confirm":
+            setConfirm({ title: data.title, detail: data.detail });
+            break;
+          case "ask_guest_id": {
+            // window.prompt() is synchronous — blocks until the user responds.
+            const raw = window.prompt(data.prompt + `\n\nDefault: ${data.default}`, data.default);
+            const value = (raw !== null && raw.trim()) ? raw.trim() : data.default;
+            ws.send(`__guest_id:${value}`);
+            break;
+          }
+        }
+      };
+    }
+    connect();
+    return () => wsRef.current?.close();
+  }, [addMsg]);
+
+  const sendText = (text) => {
+    wsRef.current?.send(text);
+    addMsg({ type: "user", text });
+  };
+
+  const answerConfirm = (yes) => {
+    wsRef.current?.send(`__confirm:${yes ? "y" : "n"}`);
+    addMsg({ type: "info", message: yes ? "✓ Confirmed" : "✗ Declined" });
+    setConfirm(null);
+  };
+
+  const isIdle = agentState === "idle" && !confirm;
+
+  return (
+    <div className="flex flex-col h-full">
+
+      {/* Header */}
+      <div className="bg-slate-900 border-b border-slate-700 px-5 py-3 flex items-center gap-3 shrink-0">
+        <ConnectionDot connected={connected} />
+        <span className="font-semibold text-slate-100">Modular Agent</span>
+        {banner && (
+          <span className="ml-2 text-xs text-slate-500">
+            {banner.project} · <span className="text-slate-400">{banner.model}</span>
+          </span>
+        )}
+        <span className="ml-auto text-xs text-slate-600">
+          {agentState !== "idle" ? agentState.replace("_", " ") + "…" : ""}
+        </span>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 relative">
+        {/* Watermark */}
+        <img
+          src="/cruise.png"
+          aria-hidden="true"
+          style={{width:"420px",height:"420px",opacity:0.07,objectFit:"contain",pointerEvents:"none",
+                  position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",zIndex:0}}
+        />
+        {/* Scrollable content */}
+        <div className="absolute inset-0 overflow-y-auto px-4 pt-4 pb-2 space-y-0.5">
+          {messages.map(msg => <Message key={msg.id} msg={msg} />)}
+          {agentState !== "idle" && (
+            <ThinkingDots label={agentState === "tool_running" ? "running tool…" : "thinking…"} />
+          )}
+          <div ref={bottomRef} />
+        </div>
+      </div>
+
+      {/* Bottom bar — confirm or input */}
+      {confirm
+        ? <ConfirmBar confirm={confirm} onAnswer={answerConfirm} />
+        : <InputBar onSend={sendText} disabled={!isIdle || !connected} />
+      }
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
